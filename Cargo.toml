@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Spencer Young <spencerwyoung@outlook.com>"]
 edition = "2018"
 description = "A Clone-on-write reference-counter vector for Copy types."
-license = "LICENSE"
+license-file = "LICENSE"
 repository = "https://github.com/youngspe/arc-buffer"
 homepage = "https://github.com/youngspe/arc-buffer"
 
