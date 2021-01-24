@@ -1,4 +1,8 @@
 #![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 extern crate alloc;
 extern crate header_slice;
 
@@ -19,9 +23,45 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::*;
 use header_slice::HeaderVec;
 
-#[derive(Default)]
+unsafe fn assume_init_drop<T>(un: &mut MaybeUninit<T>) {
+    ptr::drop_in_place(un.as_mut_ptr());
+}
+
+unsafe fn assume_init_ref<T>(un: &MaybeUninit<T>) -> &T {
+    &*(un as *const MaybeUninit<T> as *const T)
+}
+
+unsafe fn assume_init_mut<T>(un: &mut MaybeUninit<T>) -> &mut T {
+    &mut *(un as *mut MaybeUninit<T> as *mut T)
+}
+
 struct Header {
     pub count: AtomicUsize,
+    #[cfg(test)]
+    pub drop_hook: Option<Box<dyn FnMut() + Send + 'static>>,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Header {
+            count: AtomicUsize::new(1),
+            #[cfg(test)]
+            drop_hook: None,
+        }
+    }
+}
+#[cfg(test)]
+fn panic_hook() {
+    panic!("drop hook not registered");
+}
+
+#[cfg(test)]
+impl Drop for Header {
+    fn drop(&mut self) {
+        if let Some(ref mut hook) = self.drop_hook.take() {
+            hook()
+        }
+    }
 }
 
 pub struct ArcBuffer<T> {
@@ -29,6 +69,13 @@ pub struct ArcBuffer<T> {
 }
 
 impl<T> ArcBuffer<T> {
+    #[cfg(test)]
+    unsafe fn set_drop_hook<F: FnMut() + Send + 'static>(&mut self, hook: Option<F>) {
+        self.inner_mut().head.drop_hook = match hook {
+            Some(hook) => Some(Box::new(hook)),
+            None => None,
+        };
+    }
     pub fn new() -> Self {
         Self::from_inner(Default::default())
     }
@@ -46,11 +93,11 @@ impl<T> ArcBuffer<T> {
     }
 
     fn inner(&self) -> &HeaderVec<Header, T> {
-        unsafe { &*self.inner.as_ptr() }
+        unsafe { assume_init_ref(&self.inner) }
     }
 
     unsafe fn inner_mut(&mut self) -> &mut HeaderVec<Header, T> {
-        &mut *self.inner.as_mut_ptr()
+        assume_init_mut(&mut self.inner)
     }
 
     pub fn len(&self) -> usize {
@@ -85,12 +132,7 @@ impl<T> ArcBuffer<MaybeUninit<T>> {
 impl<T: Copy> ArcBuffer<T> {
     pub fn copy_from_slice(src: &[T]) -> Self {
         Self {
-            inner: MaybeUninit::new(HeaderVec::copy_from_slice(
-                Header {
-                    count: AtomicUsize::new(1),
-                },
-                src,
-            )),
+            inner: MaybeUninit::new(HeaderVec::copy_from_slice(Header::default(), src)),
         }
     }
 
@@ -100,12 +142,7 @@ impl<T: Copy> ArcBuffer<T> {
 
     pub fn filled(value: T, len: usize) -> Self {
         unsafe {
-            let mut uninit = HeaderVec::new_uninit_values(
-                Header {
-                    count: AtomicUsize::new(1),
-                },
-                len,
-            );
+            let mut uninit = HeaderVec::new_uninit_values(Header::default(), len);
 
             for x in &mut uninit.body {
                 *x = MaybeUninit::new(value);
@@ -118,18 +155,18 @@ impl<T: Copy> ArcBuffer<T> {
     }
 
     fn inner_unique(&mut self) -> &mut HeaderVec<Header, T> {
-        if self
-            .inner()
-            .head
-            .count
-            .compare_exchange(1, 0, Acquire, Relaxed)
-            .is_err()
-        {
+        if self.inner().head.count.load(Acquire) > 1 {
+            #[allow(unused_mut)]
             let mut temp = self.copy_to_new();
-            mem::swap(self, &mut temp);
-            mem::forget(temp);
-        } else {
-            self.inner().head.count.store(1, Release);
+
+            #[cfg(test)]
+            if self.inner().head.drop_hook.is_some() {
+                unsafe {
+                    temp.set_drop_hook(Some(panic_hook));
+                }
+            }
+
+            *self = temp;
         }
 
         unsafe { self.inner_mut() }
@@ -231,9 +268,9 @@ impl<T> Clone for ArcBuffer<T> {
 
 impl<T> Drop for ArcBuffer<T> {
     fn drop(&mut self) {
-        unsafe {
-            if self.inner().head.count.fetch_sub(1, Release) == 0 {
-                ptr::drop_in_place(&mut self.inner);
+        if self.inner().head.count.fetch_sub(1, Release) == 1 {
+            unsafe {
+                assume_init_drop(&mut self.inner);
             }
         }
     }
@@ -355,6 +392,9 @@ where
         <[T] as fmt::Display>::fmt(self, f)
     }
 }
+
+unsafe impl<T> Send for ArcBuffer<T> {}
+unsafe impl<T> Sync for ArcBuffer<T> {}
 
 #[macro_export]
 macro_rules! arc_buf {
